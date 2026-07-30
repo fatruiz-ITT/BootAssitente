@@ -3,7 +3,12 @@ import logging
 import asyncio
 import sqlite3
 import aiohttp
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 from aiohttp import web
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
@@ -18,15 +23,30 @@ from pypdf import PdfReader
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# =============================================================
+# CONFIGURACIÓN Y MODO PRUEBA
+# =============================================================
+# Cambia a True para tus videos (no pedirá API Key ni menú de config)
+# Cambia a False para producción multiusuario normal
+MODO_PRUEBA = True
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 
+# Credenciales SMTP para Correo
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+
+GLOBAL_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+
 DB_NAME = "user_preferences.db"
 
 # -------------------------------------------------------------
-# Base de Datos
+# Base de Datos SQLite (Con Memoria Histórica)
 # -------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -40,8 +60,40 @@ def init_db():
             user_phone TEXT
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            role TEXT,
+            content TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
+
+def save_history(user_id: int, role: str, content: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO history (user_id, role, content) VALUES (?, ?, ?)', (user_id, role, content))
+    conn.commit()
+    conn.close()
+
+def get_recent_history(user_id: int, limit: int = 10) -> str:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT role, content, timestamp FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?', (user_id, limit))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        return "No hay historial previo."
+    
+    rows.reverse()
+    formatted = []
+    for r in rows:
+        formatted.append(f"[{r[2]}] {r[0].upper()}: {r[1]}")
+    return "\n".join(formatted)
 
 def get_user_data(user_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -51,7 +103,7 @@ def get_user_data(user_id: int):
     conn.close()
     if row:
         return {"provider": row[0], "api_key": row[1], "awaiting_key": row[2], "user_phone": row[3]}
-    return {"provider": "gemini", "api_key": None, "awaiting_key": 0, "user_phone": None}
+    return {"provider": "gemini", "api_key": GLOBAL_GEMINI_KEY, "awaiting_key": 0, "user_phone": None}
 
 def save_user_provider(user_id: int, provider: str):
     conn = sqlite3.connect(DB_NAME)
@@ -94,6 +146,30 @@ def save_user_phone(user_id: int, phone: str):
     conn.close()
 
 # -------------------------------------------------------------
+# Envío de Correo por SMTP
+# -------------------------------------------------------------
+def send_email(to_email: str, subject: str, body: str) -> bool:
+    if not SMTP_EMAIL or not SMTP_PASSWORD:
+        logging.error("Faltan credenciales SMTP.")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        logging.error(f"Error enviando correo: {e}")
+        return False
+
+# -------------------------------------------------------------
 # Envío de WhatsApp con Twilio
 # -------------------------------------------------------------
 def send_whatsapp_message(to_number: str, message_body: str) -> bool:
@@ -119,24 +195,50 @@ def send_whatsapp_message(to_number: str, message_body: str) -> bool:
 # Comandos del Bot
 # -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    user_data = get_user_data(user_id)
-    provider_name = user_data['provider'].upper()
-    phone_str = user_data['user_phone'] if user_data['user_phone'] else "No registrado"
-    
-    msg = (
-        f"👋 <b>¡Hola! Soy tu asistente inteligente.</b>\n\n"
-        f"🤖 <b>Motor activo:</b> {provider_name}\n"
-        f"📱 <b>Tu WhatsApp:</b> {phone_str}\n\n"
-        "<b>📌 Capacidades disponibles:</b>\n"
-        "• 🎧 <b>Notas de voz:</b> Te las proceso directamente.\n"
-        "• 📄 <b>PDFs:</b> Súbelos para resúmenes o guías de estudio.\n"
-        "• /modelo - Cambia de motor de IA.\n"
-        "• /set_key - Registra tu API Key.\n"
-        "• /mi_numero +521... - Guarda tu WhatsApp.\n"
-        "• /whatsapp Hola - Mándate notas por WhatsApp."
-    )
+    if MODO_PRUEBA:
+        msg = (
+            "<b>Hola! Soy tu asistente inteligente</b> 🤖✨\n\n"
+            "<b>Puedo ayudarte con:</b>\n"
+            "• 🎧 <b>Procesamiento de Voz:</b> Mándame audios y los interpreto al instante.\n"
+            "• 📄 <b>Análisis de PDFs:</b> Subes un documento y te genero resúmenes y guías de estudio.\n"
+            "• 🧠 <b>Memoria de Contexto:</b> Recuerdo tus actividades e historial de tareas.\n"
+            "• 💬 <b>WhatsApp Directo:</b> Envió mensajes de recordatorios a tu celular con /whatsapp.\n"
+            "• 📧 <b>Envío de Correos:</b> Redacto y envío correos con /email.\n"
+            "• 📅 <b>Organización:</b> Planificación de juntas y minutas ejecutivas."
+        )
+    else:
+        user_id = update.message.from_user.id
+        user_data = get_user_data(user_id)
+        provider_name = user_data['provider'].upper()
+        phone_str = user_data['user_phone'] if user_data['user_phone'] else "No registrado"
+        
+        msg = (
+            f"👋 <b>¡Hola! Soy tu asistente inteligente.</b>\n\n"
+            f"🤖 <b>Motor activo:</b> {provider_name}\n"
+            f"📱 <b>Tu WhatsApp:</b> {phone_str}\n\n"
+            "<b>📌 Capacidades disponibles:</b>\n"
+            "• /modelo - Cambia de motor de IA.\n"
+            "• /set_key - Registra tu API Key.\n"
+            "• /mi_numero +521... - Guarda tu WhatsApp.\n"
+            "• /whatsapp Hola - Envia notas por WhatsApp."
+        )
     await update.message.reply_text(msg, parse_mode="HTML")
+
+async def send_email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ <b>Uso correcto:</b> <code>/email correo@ejemplo.com Asunto Mensaje</code>", parse_mode="HTML")
+        return
+    
+    to_email = context.args[0].strip()
+    subject = context.args[1].strip()
+    body = " ".join(context.args[2:])
+    
+    await update.message.reply_text("📧 Enviando correo electrónico...")
+    success = send_email(to_email, subject, body)
+    if success:
+        await update.message.reply_text(f"✅ <b>Correo enviado con éxito a {to_email}</b>", parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ <b>Error al enviar el correo.</b> Verifica la configuración SMTP.", parse_mode="HTML")
 
 async def select_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -165,17 +267,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     save_user_provider(user_id, provider)
     user_data = get_user_data(user_id)
-    
     key_status = "✅ Configurada" if user_data["api_key"] else "❌ No configurada"
 
     await query.edit_message_text(
-        f"🎉 <b>¡Motor cambiado a {provider.upper()}!</b>\n\n🔑 API Key: {key_status}\n\nUsa /set_key si deseas cambiar la clave.",
+        f"🎉 <b>¡Motor cambiado a {provider.upper()}!</b>\n\n🔑 API Key: {key_status}",
         parse_mode="HTML"
     )
 
 async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    
     if context.args:
         key = context.args[0].strip()
         save_user_key(user_id, key)
@@ -235,13 +335,13 @@ async def send_whatsapp_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ <b>Error al enviar.</b> Asegúrate de enviar primero el comando <code>join</code> a Twilio.", parse_mode="HTML")
 
 # -------------------------------------------------------------
-# Procesador Unificado (Texto, Voz Nactiva y PDFs)
+# Procesador Unificado Multimodal con Memoria Histórica
 # -------------------------------------------------------------
 async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
 
-    if user_data["awaiting_key"] == 1:
+    if not MODO_PRUEBA and user_data["awaiting_key"] == 1:
         new_key = update.message.text.strip()
         save_user_key(user_id, new_key)
         await update.message.reply_text(
@@ -254,11 +354,11 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     provider = user_data["provider"]
-    api_key = user_data["api_key"]
+    api_key = GLOBAL_GEMINI_KEY if MODO_PRUEBA else user_data["api_key"]
 
     if not api_key:
         await update.message.reply_text(
-            f"⚠️ <b>Falta API Key para {provider.upper()}.</b> Escribe /set_key para ingresarla.",
+            f"⚠️ <b>Falta API Key.</b> Escribe /set_key para ingresarla o configura GEMINI_API_KEY.",
             parse_mode="HTML"
         )
         return
@@ -268,11 +368,10 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_text = update.message.text or update.message.caption or ""
 
     status_icon = "🎧" if is_voice else ("📄" if is_doc else "💬")
-    await update.message.reply_text(f"{status_icon} Procesando con {provider.upper()}...")
+    await update.message.reply_text(f"{status_icon} Procesando...")
 
     file_path = None
     try:
-        # Descarga de archivo de audio o PDF
         if is_voice:
             voice_file = await context.bot.get_file(update.message.voice.file_id)
             file_path = f"voice_{update.message.message_id}.ogg"
@@ -283,19 +382,19 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             file_path = f"doc_{update.message.message_id}.pdf"
             await doc_file.download_to_drive(file_path)
 
+        # Recuperar historial reciente para dar memoria a la IA
+        history_context = get_recent_history(user_id, limit=8)
+
         system_instructions = (
-            "Eres un asistente personal experto tipo NotebookLM. Instrucciones de respuesta:\n"
-            "1. Sé conciso, directo y estructurado en HTML limpio de Telegram (<b>negrita</b>).\n"
-            "2. Si procesas un PDF o Nota de Voz tipo clase/reunión, organízalo como Guía NotebookLM:\n"
-            "   • 📌 <b>Resumen Ejecutivo</b>\n"
-            "   • 🎯 <b>Preguntas Clave para Examen/Estudio</b>\n"
-            "   • 🗣️ <b>Estructura para Exposición</b>\n"
-            "   • 📝 <b>Tareas o Acuerdos Pendientes</b>"
+            "Eres un asistente ejecutivo personal con memoria inteligente. Reglas de respuesta:\n"
+            "1. Responde en formato HTML limpio de Telegram (usando <b>negrita</b>).\n"
+            "2. Consulta el HISTORIAL PREVIO para responder preguntas sobre tareas pasadas o compromisos que el usuario mencionó antes.\n"
+            "3. Si es un PDF o audio de clase/junta, estructura como NotebookLM (Resumen, Preguntas clave y Tareas).\n\n"
+            f"--- HISTORIAL DE CONVERSACIÓN RECIENTE ---\n{history_context}\n------------------------------------------"
         )
 
         ai_response = ""
 
-        # --- MOTOR GEMINI ---
         if provider == "gemini":
             client = genai.Client(api_key=api_key)
             contents = [system_instructions]
@@ -305,7 +404,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 contents.append(uploaded_file)
             
             if user_text:
-                contents.append(f"Mensaje del usuario: {user_text}")
+                contents.append(f"Mensaje actual del usuario: {user_text}")
 
             res = client.models.generate_content(
                 model='gemini-flash-latest',
@@ -313,7 +412,6 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.text
 
-        # --- MOTOR OPENAI ---
         elif provider == "openai":
             client = OpenAI(api_key=api_key)
             prompt_content = user_text
@@ -321,11 +419,11 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if is_voice:
                 with open(file_path, "rb") as audio:
                     transcript = client.audio.transcriptions.create(model="whisper-1", file=audio)
-                prompt_content = f"Audio transcrito: {transcript.text}\n\nInstrucción extra: {user_text}"
+                prompt_content = f"Audio transcrito: {transcript.text}\n\nMensaje: {user_text}"
             elif is_doc:
                 reader = PdfReader(file_path)
                 pdf_text = "".join([page.extract_text() or "" for page in reader.pages])
-                prompt_content = f"Texto extraído del PDF:\n{pdf_text[:12000]}\n\nInstrucción extra: {user_text}"
+                prompt_content = f"PDF:\n{pdf_text[:12000]}\n\nMensaje: {user_text}"
 
             res = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -336,7 +434,6 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.choices[0].message.content
 
-        # --- MOTOR CLAUDE ---
         elif provider == "claude":
             client = anthropic.Anthropic(api_key=api_key)
             prompt_content = user_text
@@ -345,9 +442,9 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if is_doc:
                     reader = PdfReader(file_path)
                     pdf_text = "".join([page.extract_text() or "" for page in reader.pages])
-                    prompt_content = f"Texto del documento:\n{pdf_text[:12000]}\n\nInstrucción: {user_text}"
+                    prompt_content = f"PDF:\n{pdf_text[:12000]}\n\nMensaje: {user_text}"
                 else:
-                    prompt_content = f"Nota de voz recibida. Instrucción: {user_text}"
+                    prompt_content = f"Audio recibido. Mensaje: {user_text}"
 
             res = client.messages.create(
                 model="claude-3-5-sonnet-20241022",
@@ -357,6 +454,12 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ai_response = res.content[0].text
 
         formatted_response = ai_response.replace('**', '<b>').replace('**', '</b>')
+        
+        # Guardar en la base de datos la interacción actual para futura memoria
+        input_log = user_text if user_text else ("Nota de Voz" if is_voice else "Archivo PDF")
+        save_history(user_id, "usuario", input_log)
+        save_history(user_id, "asistente", formatted_response)
+
         await update.message.reply_text(formatted_response, parse_mode="HTML")
 
     except Exception as e:
@@ -395,6 +498,7 @@ async def main():
     app.add_handler(CommandHandler("set_key", set_key_command))
     app.add_handler(CommandHandler("mi_numero", set_my_phone_command))
     app.add_handler(CommandHandler("whatsapp", send_whatsapp_command))
+    app.add_handler(CommandHandler("email", send_email_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     
     app.add_handler(MessageHandler(filters.VOICE, process_user_input))
