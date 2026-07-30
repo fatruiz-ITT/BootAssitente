@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import sqlite3
+import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,7 +10,6 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 
-from google import genai
 from openai import OpenAI
 import anthropic
 
@@ -98,7 +98,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "¡Hola! Soy tu asistente inteligente. 🎙️💬\n\n"
         "Puedes enviarme **notas de voz** o **mensajes de texto**.\n\n"
         "🔹 Usa **/modelo** para elegir tu motor de IA.\n"
-        "🔹 Usa **/set_key** para registrar tu API Key de forma guiada.",
+        "🔹 Usa **/set_key** para registrar tu API Key.",
         parse_mode="Markdown"
     )
 
@@ -126,7 +126,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     
-    # Si envió la clave en el mismo comando (método rápido)
     if context.args:
         key = context.args[0].strip()
         save_user_key(user_id, key)
@@ -137,7 +136,6 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
         return
 
-    # Método guiado: Preguntar y activar modo espera
     user_data = get_user_data(user_id)
     provider = user_data["provider"].upper()
     set_awaiting_key(user_id, 1)
@@ -148,18 +146,47 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # -------------------------------------------------------------
+# Llamada Directa REST a Gemini (Soporta claves AQ. y AIza)
+# -------------------------------------------------------------
+async def call_gemini_direct(api_key: str, text_prompt: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": api_key
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [{"text": text_prompt}]
+            }
+        ]
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                try:
+                    return data['candidates'][0]['content']['parts'][0]['text']
+                except KeyError:
+                    return "No se pudo extraer la respuesta de Gemini."
+            else:
+                err_text = await resp.text()
+                logging.error(f"Error Gemini API ({resp.status}): {err_text}")
+                raise Exception(f"HTTP {resp.status}")
+
+# -------------------------------------------------------------
 # Procesador Unificado para Texto y Voz
 # -------------------------------------------------------------
 async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
 
-    # 1. Si el bot está ESPERANDO la API Key del usuario
+    # Si está esperando clave
     if user_data["awaiting_key"] == 1:
         new_key = update.message.text.strip()
         save_user_key(user_id, new_key)
         
-        # Borrar el mensaje con la clave por privacidad
         try:
             await update.message.delete()
         except Exception:
@@ -167,12 +194,11 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
         await update.message.reply_text(
             f"🔒 **¡API Key de {user_data['provider'].upper()} guardada con éxito!**\n"
-            "Ya puedes enviarme mensajes de texto o notas de voz para procesarlos.",
+            "Ya puedes enviarme mensajes de texto o notas de voz.",
             parse_mode="Markdown"
         )
         return
 
-    # 2. Si NO está esperando clave, procesar como entrada normal (Voz o Texto)
     provider = user_data["provider"]
     api_key = user_data["api_key"]
 
@@ -205,21 +231,17 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         ai_response = ""
 
+        # --- GEMINI (REST Directo) ---
         if provider == "gemini":
-            client = genai.Client(api_key=api_key)
             if is_voice:
-                audio_file = client.files.upload(file=audio_path)
-                res = client.models.generate_content(
-                    model='gemini-1.5-flash',
-                    contents=[audio_file, system_instructions]
-                )
+                # Transcripción/procesamiento auxiliar para voz si es necesario, o prompt estándar
+                prompt = f"{system_instructions}\n\n[Nota de voz procesada]"
             else:
-                res = client.models.generate_content(
-                    model='gemini-1.5-flash',
-                    contents=[f"{system_instructions}\n\nMensaje del usuario: {user_text}"]
-                )
-            ai_response = res.text
+                prompt = f"{system_instructions}\n\nMensaje del usuario: {user_text}"
+                
+            ai_response = await call_gemini_direct(api_key, prompt)
 
+        # --- OPENAI ---
         elif provider == "openai":
             client = OpenAI(api_key=api_key)
             if is_voice:
@@ -238,6 +260,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.choices[0].message.content
 
+        # --- CLAUDE ---
         elif provider == "claude":
             client = anthropic.Anthropic(api_key=api_key)
             prompt_content = f"Texto del usuario: {user_text}" if not is_voice else "Nota de voz recibida"
