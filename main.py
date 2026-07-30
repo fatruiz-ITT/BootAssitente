@@ -93,8 +93,10 @@ async def start_web_server():
 # -------------------------------------------------------------
 # Petición Directa HTTP a Gemini (Compatible con AQ... y AIza...)
 # -------------------------------------------------------------
+
 async def call_gemini_api(api_key: str, text_prompt: str) -> str:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    # Usamos gemini-2.5-flash que es el modelo compatible con claves AQ
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": api_key
