@@ -19,7 +19,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
 
 DB_NAME = "user_preferences.db"
 
@@ -92,16 +92,15 @@ def save_user_phone(user_id: int, phone: str):
     conn.close()
 
 # -------------------------------------------------------------
-# Función Auxiliar WhatsApp (Twilio)
+# Envío de WhatsApp con Twilio
 # -------------------------------------------------------------
 def send_whatsapp_message(to_number: str, message_body: str) -> bool:
-    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_NUMBER:
-        logging.error("Faltan variables de entorno para Twilio.")
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        logging.error("Faltan credenciales de Twilio.")
         return False
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         
-        # Asegurar formato whatsapp:+...
         formatted_to = to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}"
         formatted_from = TWILIO_WHATSAPP_NUMBER if TWILIO_WHATSAPP_NUMBER.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
         
@@ -112,11 +111,11 @@ def send_whatsapp_message(to_number: str, message_body: str) -> bool:
         )
         return True
     except Exception as e:
-        logging.error(f"Error enviando WhatsApp con Twilio: {e}")
+        logging.error(f"Error enviando WhatsApp: {e}")
         return False
 
 # -------------------------------------------------------------
-# Petición Directa HTTP a Gemini (gemini-flash-latest)
+# Petición Directa HTTP a Gemini
 # -------------------------------------------------------------
 async def call_gemini_api(api_key: str, text_prompt: str) -> str:
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
@@ -135,18 +134,20 @@ async def call_gemini_api(api_key: str, text_prompt: str) -> str:
                 try:
                     candidates = data.get('candidates', [])
                     if not candidates:
-                        return "Gemini no devolvió ninguna respuesta."
+                        return "Sin respuesta de Gemini."
                     parts = candidates[0].get('content', {}).get('parts', [])
                     for part in parts:
                         if 'text' in part:
-                            return part['text']
-                    return "No se encontró texto en la respuesta de Gemini."
+                            # Reemplazar sintaxis Markdown por sintaxis HTML limpia para Telegram
+                            text = part['text'].replace('**', '<b>').replace('**', '</b>')
+                            return text
+                    return "No se encontró texto en la respuesta."
                 except Exception as e:
-                    return f"Error leyendo la respuesta: {e}"
+                    return f"Error procesando texto: {e}"
             else:
                 err = await resp.text()
-                logging.error(f"Error Gemini API Status {resp.status}: {err}")
-                raise Exception(f"HTTP {resp.status}: {err}")
+                logging.error(f"Error Gemini API ({resp.status}): {err}")
+                raise Exception(f"HTTP {resp.status}")
 
 # -------------------------------------------------------------
 # Comandos del Bot
@@ -155,15 +156,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
     provider_name = user_data['provider'].upper()
+    phone_str = user_data['user_phone'] if user_data['user_phone'] else "No registrado"
     
     msg = (
-        f"👋 <b>¡Hola! Soy tu asistente inteligente por voz y texto.</b>\n\n"
-        f"🤖 <b>Motor actual:</b> {provider_name}\n\n"
-        "<b>📌 Comandos principales:</b>\n"
-        "• /modelo - Cambia entre Gemini, OpenAI o Claude.\n"
+        f"👋 <b>¡Hola! Soy tu asistente inteligente.</b>\n\n"
+        f"🤖 <b>Motor activo:</b> {provider_name}\n"
+        f"📱 <b>Tu WhatsApp registrado:</b> {phone_str}\n\n"
+        "<b>📌 Comandos disponibles:</b>\n"
+        "• /modelo - Cambia de motor (Gemini, OpenAI, Claude).\n"
         "• /set_key - Registra tu API Key.\n"
-        "• /mi_numero +52123456789 - Guarda tu número para recibir WhatsApps.\n"
-        "• /whatsapp +52123456789 Tu Mensaje - Envía un WhatsApp directo."
+        "• /mi_numero +521... - Guarda tu teléfono para enviarte notas a tu WhatsApp.\n"
+        "• /whatsapp +521... Hola - Envía un WhatsApp a otro usuario."
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -180,7 +183,7 @@ async def select_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"⚙️ <b>Configuración de Motor de IA</b>\n\nActualmente usas: <b>{current_provider}</b>\n\nSelecciona el nuevo motor:",
+        f"⚙️ <b>Configuración de Motor</b>\n\nMotor actual: <b>{current_provider}</b>\nSelecciona el nuevo motor:",
         reply_markup=reply_markup,
         parse_mode="HTML"
     )
@@ -198,7 +201,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key_status = "✅ Configurada" if user_data["api_key"] else "❌ No configurada"
 
     await query.edit_message_text(
-        f"🎉 <b>¡Motor cambiado a {provider.upper()}!</b>\n\n🔑 API Key: {key_status}\n\nEscribe /set_key si necesitas actualizar tu clave.",
+        f"🎉 <b>¡Motor cambiado a {provider.upper()}!</b>\n\n🔑 API Key: {key_status}\n\nUsa /set_key si deseas cambiar la clave.",
         parse_mode="HTML"
     )
 
@@ -220,7 +223,7 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_awaiting_key(user_id, 1)
     
     await update.message.reply_text(
-        f"📥 <b>Configuración para {provider}</b>\n\nEnvía tu API Key en el siguiente mensaje:",
+        f"📥 <b>Configuración de clave para {provider}</b>\n\nEnvía tu API Key en el siguiente mensaje:",
         parse_mode="HTML"
     )
 
@@ -232,26 +235,43 @@ async def set_my_phone_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     phone = context.args[0].strip()
     save_user_phone(user_id, phone)
-    await update.message.reply_text(f"📱 <b>Teléfono guardado:</b> <code>{phone}</code>\nAhora podrás enviarte resúmenes por WhatsApp.", parse_mode="HTML")
+    await update.message.reply_text(f"📱 <b>Tu teléfono quedó guardado:</b> <code>{phone}</code>\n¡Ya puedes enviarte notas directas!", parse_mode="HTML")
 
 async def send_whatsapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ <b>Uso correcto:</b> <code>/whatsapp +521234567890 Hola esto es una prueba</code>", parse_mode="HTML")
+    user_id = update.message.from_user.id
+    user_data = get_user_data(user_id)
+
+    # 1. Enviar a otro usuario especificado: /whatsapp +521... Mensaje
+    if len(context.args) >= 2 and context.args[0].startswith("+"):
+        to_phone = context.args[0].strip()
+        message_text = " ".join(context.args[1:])
+    # 2. Enviar a uno mismo si guardó su número: /whatsapp Mensaje
+    elif user_data["user_phone"]:
+        to_phone = user_data["user_phone"]
+        message_text = " ".join(context.args)
+    else:
+        await update.message.reply_text(
+            "❌ <b>Uso:</b>\n"
+            "• A otro usuario: <code>/whatsapp +521234567890 Tu mensaje</code>\n"
+            "• A ti mismo: Guarda tu número primero con <code>/mi_numero +521...</code>",
+            parse_mode="HTML"
+        )
         return
     
-    to_phone = context.args[0].strip()
-    message_text = " ".join(context.args[1:])
-    
+    if not message_text.strip():
+        await update.message.reply_text("⚠️ Escribe un mensaje para enviar por WhatsApp.", parse_mode="HTML")
+        return
+
     await update.message.reply_text("💬 Enviando WhatsApp...")
     
     success = send_whatsapp_message(to_phone, message_text)
     if success:
         await update.message.reply_text(f"✅ <b>WhatsApp enviado con éxito a {to_phone}</b>", parse_mode="HTML")
     else:
-        await update.message.reply_text("❌ <b>Error al enviar WhatsApp.</b> Revisa que el número esté registrado en el Sandbox de Twilio.", parse_mode="HTML")
+        await update.message.reply_text("❌ <b>Error al enviar.</b> Asegúrate de que el número esté registrado en el Sandbox de Twilio.", parse_mode="HTML")
 
 # -------------------------------------------------------------
-# Procesador Unificado para Texto y Voz (Smart Formatting)
+# Procesador Unificado para Texto y Voz (Formato HTML Limpio)
 # -------------------------------------------------------------
 async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -261,7 +281,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         new_key = update.message.text.strip()
         save_user_key(user_id, new_key)
         await update.message.reply_text(
-            f"🔒 <b>¡API Key de {user_data['provider'].upper()} activada!</b>", parse_mode="HTML"
+            f"🔒 <b>¡API Key de {user_data['provider'].upper()} guardada!</b>", parse_mode="HTML"
         )
         try:
             await update.message.delete()
@@ -274,7 +294,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not api_key:
         await update.message.reply_text(
-            f"⚠️ <b>Atención:</b> Seleccionaste {provider.upper()} pero falta tu API Key.\nEscribe /set_key para ingresarla.",
+            f"⚠️ <b>Falta API Key para {provider.upper()}.</b> Escribe /set_key para ingresarla.",
             parse_mode="HTML"
         )
         return
@@ -292,18 +312,17 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await voice_file.download_to_drive(audio_path)
 
     try:
-        # Prompt Adaptativo e Inteligente
         system_instructions = (
-            "Eres un asistente personal ultra eficiente y conciso. Reglas de respuesta:\n"
-            "1. Sé directo, breve y scannable. Usa viñetas limpias y negritas en conceptos clave.\n"
-            "2. Si la entrada es una nota de voz, llamada o un resumen de reunión, estructúrala en: 📌 Resumen, 📝 Tareas pendientes y 📅 Fechas/Citas.\n"
-            "3. Si es una pregunta libre, receta o solicitud de ideas, responde directo a lo solicitado sin forzar categorías rígidas ni textos largos.\n"
-            "4. NO uses marcas de agua ni introducciones innecesarias."
+            "Eres un asistente personal ultra eficiente. Reglas estrictas de formato:\n"
+            "1. Responde de forma limpia, directa y con viñetas scannables.\n"
+            "2. NO uses corchetes o etiquetas Markdown pesadas. Usa negritas HTML limpias en conceptos clave.\n"
+            "3. Si es una consulta rápida o receta, responde directo al grano.\n"
+            "4. Si es una nota de voz o resumen de reunión, organízalo en: Resumen, Tareas y Citas."
         )
         ai_response = ""
 
         if provider == "gemini":
-            prompt = f"{system_instructions}\n\nMensaje/Audio del usuario: {user_text if user_text else 'Nota de voz recibida'}"
+            prompt = f"{system_instructions}\n\nMensaje/Audio del usuario: {user_text if user_text else 'Nota de voz procesada'}"
             ai_response = await call_gemini_api(api_key, prompt)
 
         elif provider == "openai":
@@ -311,9 +330,9 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if is_voice:
                 with open(audio_path, "rb") as audio:
                     transcript = client.audio.transcriptions.create(model="whisper-1", file=audio)
-                prompt_content = f"Transcripción de voz: {transcript.text}"
+                prompt_content = f"Audio transcrito: {transcript.text}"
             else:
-                prompt_content = f"Usuario: {user_text}"
+                prompt_content = f"Texto del usuario: {user_text}"
 
             res = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -326,7 +345,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         elif provider == "claude":
             client = anthropic.Anthropic(api_key=api_key)
-            prompt_content = f"Usuario: {user_text}" if not is_voice else "Nota de voz recibida"
+            prompt_content = f"Texto: {user_text}" if not is_voice else "Audio recibido"
             res = client.messages.create(
                 model="claude-3-5-sonnet-20241022",
                 max_tokens=1000,
@@ -334,7 +353,9 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.content[0].text
 
-        await update.message.reply_text(ai_response)
+        # Formatear a negrita HTML nativa de Telegram para evitar que salgan los astériscos fetiches
+        formatted_response = ai_response.replace('**', '<b>').replace('**', '</b>')
+        await update.message.reply_text(formatted_response, parse_mode="HTML")
 
     except Exception as e:
         logging.error(f"Error procesando con {provider}: {e}")
