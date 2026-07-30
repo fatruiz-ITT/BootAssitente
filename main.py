@@ -10,9 +10,11 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 
+from google import genai
 from openai import OpenAI
 import anthropic
 from twilio.rest import Client
+from pypdf import PdfReader
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -100,7 +102,6 @@ def send_whatsapp_message(to_number: str, message_body: str) -> bool:
         return False
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        
         formatted_to = to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}"
         formatted_from = TWILIO_WHATSAPP_NUMBER if TWILIO_WHATSAPP_NUMBER.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_NUMBER}"
         
@@ -115,41 +116,6 @@ def send_whatsapp_message(to_number: str, message_body: str) -> bool:
         return False
 
 # -------------------------------------------------------------
-# Petición Directa HTTP a Gemini
-# -------------------------------------------------------------
-async def call_gemini_api(api_key: str, text_prompt: str) -> str:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key
-    }
-    payload = {
-        "contents": [{"parts": [{"text": text_prompt}]}]
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                try:
-                    candidates = data.get('candidates', [])
-                    if not candidates:
-                        return "Sin respuesta de Gemini."
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    for part in parts:
-                        if 'text' in part:
-                            # Reemplazar sintaxis Markdown por sintaxis HTML limpia para Telegram
-                            text = part['text'].replace('**', '<b>').replace('**', '</b>')
-                            return text
-                    return "No se encontró texto en la respuesta."
-                except Exception as e:
-                    return f"Error procesando texto: {e}"
-            else:
-                err = await resp.text()
-                logging.error(f"Error Gemini API ({resp.status}): {err}")
-                raise Exception(f"HTTP {resp.status}")
-
-# -------------------------------------------------------------
 # Comandos del Bot
 # -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,12 +127,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"👋 <b>¡Hola! Soy tu asistente inteligente.</b>\n\n"
         f"🤖 <b>Motor activo:</b> {provider_name}\n"
-        f"📱 <b>Tu WhatsApp registrado:</b> {phone_str}\n\n"
-        "<b>📌 Comandos disponibles:</b>\n"
-        "• /modelo - Cambia de motor (Gemini, OpenAI, Claude).\n"
+        f"📱 <b>Tu WhatsApp:</b> {phone_str}\n\n"
+        "<b>📌 Capacidades disponibles:</b>\n"
+        "• 🎧 <b>Notas de voz:</b> Te las proceso directamente.\n"
+        "• 📄 <b>PDFs:</b> Súbelos para resúmenes o guías de estudio.\n"
+        "• /modelo - Cambia de motor de IA.\n"
         "• /set_key - Registra tu API Key.\n"
-        "• /mi_numero +521... - Guarda tu teléfono para enviarte notas a tu WhatsApp.\n"
-        "• /whatsapp +521... Hola - Envía un WhatsApp a otro usuario."
+        "• /mi_numero +521... - Guarda tu WhatsApp.\n"
+        "• /whatsapp Hola - Mándate notas por WhatsApp."
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -235,25 +203,21 @@ async def set_my_phone_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     phone = context.args[0].strip()
     save_user_phone(user_id, phone)
-    await update.message.reply_text(f"📱 <b>Tu teléfono quedó guardado:</b> <code>{phone}</code>\n¡Ya puedes enviarte notas directas!", parse_mode="HTML")
+    await update.message.reply_text(f"📱 <b>Tu teléfono quedó guardado:</b> <code>{phone}</code>", parse_mode="HTML")
 
 async def send_whatsapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
 
-    # 1. Enviar a otro usuario especificado: /whatsapp +521... Mensaje
     if len(context.args) >= 2 and context.args[0].startswith("+"):
         to_phone = context.args[0].strip()
         message_text = " ".join(context.args[1:])
-    # 2. Enviar a uno mismo si guardó su número: /whatsapp Mensaje
     elif user_data["user_phone"]:
         to_phone = user_data["user_phone"]
         message_text = " ".join(context.args)
     else:
         await update.message.reply_text(
-            "❌ <b>Uso:</b>\n"
-            "• A otro usuario: <code>/whatsapp +521234567890 Tu mensaje</code>\n"
-            "• A ti mismo: Guarda tu número primero con <code>/mi_numero +521...</code>",
+            "❌ <b>Uso:</b>\n• A otro número: <code>/whatsapp +521... Mensaje</code>\n• A ti: Registra con <code>/mi_numero +521...</code>",
             parse_mode="HTML"
         )
         return
@@ -268,10 +232,10 @@ async def send_whatsapp_command(update: Update, context: ContextTypes.DEFAULT_TY
     if success:
         await update.message.reply_text(f"✅ <b>WhatsApp enviado con éxito a {to_phone}</b>", parse_mode="HTML")
     else:
-        await update.message.reply_text("❌ <b>Error al enviar.</b> Asegúrate de que el número esté registrado en el Sandbox de Twilio.", parse_mode="HTML")
+        await update.message.reply_text("❌ <b>Error al enviar.</b> Asegúrate de enviar primero el comando <code>join</code> a Twilio.", parse_mode="HTML")
 
 # -------------------------------------------------------------
-# Procesador Unificado para Texto y Voz (Formato HTML Limpio)
+# Procesador Unificado (Texto, Voz Nactiva y PDFs)
 # -------------------------------------------------------------
 async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -300,39 +264,68 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     is_voice = update.message.voice is not None
-    user_text = update.message.text if not is_voice else ""
+    is_doc = update.message.document is not None
+    user_text = update.message.text or update.message.caption or ""
 
-    status_icon = "🎧" if is_voice else "💬"
+    status_icon = "🎧" if is_voice else ("📄" if is_doc else "💬")
     await update.message.reply_text(f"{status_icon} Procesando con {provider.upper()}...")
 
-    audio_path = None
-    if is_voice:
-        voice_file = await context.bot.get_file(update.message.voice.file_id)
-        audio_path = f"voice_{update.message.message_id}.ogg"
-        await voice_file.download_to_drive(audio_path)
-
+    file_path = None
     try:
+        # Descarga de archivo de audio o PDF
+        if is_voice:
+            voice_file = await context.bot.get_file(update.message.voice.file_id)
+            file_path = f"voice_{update.message.message_id}.ogg"
+            await voice_file.download_to_drive(file_path)
+
+        elif is_doc:
+            doc_file = await context.bot.get_file(update.message.document.file_id)
+            file_path = f"doc_{update.message.message_id}.pdf"
+            await doc_file.download_to_drive(file_path)
+
         system_instructions = (
-            "Eres un asistente personal ultra eficiente. Reglas estrictas de formato:\n"
-            "1. Responde de forma limpia, directa y con viñetas scannables.\n"
-            "2. NO uses corchetes o etiquetas Markdown pesadas. Usa negritas HTML limpias en conceptos clave.\n"
-            "3. Si es una consulta rápida o receta, responde directo al grano.\n"
-            "4. Si es una nota de voz o resumen de reunión, organízalo en: Resumen, Tareas y Citas."
+            "Eres un asistente personal experto tipo NotebookLM. Instrucciones de respuesta:\n"
+            "1. Sé conciso, directo y estructurado en HTML limpio de Telegram (<b>negrita</b>).\n"
+            "2. Si procesas un PDF o Nota de Voz tipo clase/reunión, organízalo como Guía NotebookLM:\n"
+            "   • 📌 <b>Resumen Ejecutivo</b>\n"
+            "   • 🎯 <b>Preguntas Clave para Examen/Estudio</b>\n"
+            "   • 🗣️ <b>Estructura para Exposición</b>\n"
+            "   • 📝 <b>Tareas o Acuerdos Pendientes</b>"
         )
+
         ai_response = ""
 
+        # --- MOTOR GEMINI ---
         if provider == "gemini":
-            prompt = f"{system_instructions}\n\nMensaje/Audio del usuario: {user_text if user_text else 'Nota de voz procesada'}"
-            ai_response = await call_gemini_api(api_key, prompt)
+            client = genai.Client(api_key=api_key)
+            contents = [system_instructions]
 
+            if is_voice or is_doc:
+                uploaded_file = client.files.upload(file=file_path)
+                contents.append(uploaded_file)
+            
+            if user_text:
+                contents.append(f"Mensaje del usuario: {user_text}")
+
+            res = client.models.generate_content(
+                model='gemini-flash-latest',
+                contents=contents
+            )
+            ai_response = res.text
+
+        # --- MOTOR OPENAI ---
         elif provider == "openai":
             client = OpenAI(api_key=api_key)
+            prompt_content = user_text
+
             if is_voice:
-                with open(audio_path, "rb") as audio:
+                with open(file_path, "rb") as audio:
                     transcript = client.audio.transcriptions.create(model="whisper-1", file=audio)
-                prompt_content = f"Audio transcrito: {transcript.text}"
-            else:
-                prompt_content = f"Texto del usuario: {user_text}"
+                prompt_content = f"Audio transcrito: {transcript.text}\n\nInstrucción extra: {user_text}"
+            elif is_doc:
+                reader = PdfReader(file_path)
+                pdf_text = "".join([page.extract_text() or "" for page in reader.pages])
+                prompt_content = f"Texto extraído del PDF:\n{pdf_text[:12000]}\n\nInstrucción extra: {user_text}"
 
             res = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -343,32 +336,39 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.choices[0].message.content
 
+        # --- MOTOR CLAUDE ---
         elif provider == "claude":
             client = anthropic.Anthropic(api_key=api_key)
-            prompt_content = f"Texto: {user_text}" if not is_voice else "Audio recibido"
+            prompt_content = user_text
+
+            if is_voice or is_doc:
+                if is_doc:
+                    reader = PdfReader(file_path)
+                    pdf_text = "".join([page.extract_text() or "" for page in reader.pages])
+                    prompt_content = f"Texto del documento:\n{pdf_text[:12000]}\n\nInstrucción: {user_text}"
+                else:
+                    prompt_content = f"Nota de voz recibida. Instrucción: {user_text}"
+
             res = client.messages.create(
                 model="claude-3-5-sonnet-20241022",
-                max_tokens=1000,
+                max_tokens=1500,
                 messages=[{"role": "user", "content": f"{system_instructions}\n\n{prompt_content}"}]
             )
             ai_response = res.content[0].text
 
-        # Formatear a negrita HTML nativa de Telegram para evitar que salgan los astériscos fetiches
         formatted_response = ai_response.replace('**', '<b>').replace('**', '</b>')
         await update.message.reply_text(formatted_response, parse_mode="HTML")
 
     except Exception as e:
-        logging.error(f"Error procesando con {provider}: {e}")
-        await update.message.reply_text(
-            f"❌ <b>Error de conexión con {provider.upper()}.</b>\nDetalle: {e}", parse_mode="HTML"
-        )
-    
+        logging.error(f"Error procesando solicitud: {e}")
+        await update.message.reply_text(f"❌ <b>Error de procesamiento.</b>\nDetalle: {e}", parse_mode="HTML")
+
     finally:
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 # -------------------------------------------------------------
-# Servidor Web Render Independiente
+# Servidor Web e Inicialización
 # -------------------------------------------------------------
 async def handle_health(request):
     return web.Response(text="Bot Activo")
@@ -382,9 +382,6 @@ async def run_web():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# -------------------------------------------------------------
-# Ejecución Principal
-# -------------------------------------------------------------
 async def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("Falta TELEGRAM_TOKEN.")
@@ -401,6 +398,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     
     app.add_handler(MessageHandler(filters.VOICE, process_user_input))
+    app.add_handler(MessageHandler(filters.Document.PDF, process_user_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_user_input))
 
     await app.initialize()
