@@ -93,9 +93,7 @@ async def start_web_server():
 # -------------------------------------------------------------
 # Petición Directa HTTP a Gemini (Compatible con AQ... y AIza...)
 # -------------------------------------------------------------
-
 async def call_gemini_api(api_key: str, text_prompt: str) -> str:
-    # Usamos gemini-2.5-flash que es el modelo compatible con claves AQ
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     headers = {
         "Content-Type": "application/json",
@@ -179,7 +177,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     
-    # 1. Si la mandó junto con el comando (/set_key MI_CLAVE)
     if context.args:
         key = context.args[0].strip()
         save_user_key(user_id, key)
@@ -190,7 +187,6 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # 2. Si sólo escribió /set_key, pedirla interactivamente
     user_data = get_user_data(user_id)
     provider = user_data["provider"].upper()
     set_awaiting_key(user_id, 1)
@@ -207,27 +203,21 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
 
-    # A) Capturar clave si el bot la estaba esperando
     if user_data["awaiting_key"] == 1:
         new_key = update.message.text.strip()
-        
-        # Guardar en BD PRIMERO
         save_user_key(user_id, new_key)
         
-        # Confirmar al usuario que la clave YA se guardó
         await update.message.reply_text(
             f"🔒 ¡API Key de {user_data['provider'].upper()} guardada y activada con éxito!\n\n"
             "Ya puedes enviarme cualquier mensaje de texto para procesarlo."
         )
         
-        # Intentar borrar el mensaje con la clave al final (si falla no afecta el guardado)
         try:
             await update.message.delete()
         except Exception:
             pass
         return
 
-    # B) Procesar solicitud de IA regular
     provider = user_data["provider"]
     api_key = user_data["api_key"]
 
