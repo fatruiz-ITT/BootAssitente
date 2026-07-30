@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import sqlite3
+import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,7 +10,6 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 
-from google import genai
 from openai import OpenAI
 import anthropic
 
@@ -91,6 +91,36 @@ async def start_web_server():
     await site.start()
 
 # -------------------------------------------------------------
+# Petición Directa HTTP a Gemini (Compatible con AQ... y AIza...)
+# -------------------------------------------------------------
+async def call_gemini_api(api_key: str, text_prompt: str) -> str:
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": api_key
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [{"text": text_prompt}]
+            }
+        ]
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                try:
+                    return data['candidates'][0]['content']['parts'][0]['text']
+                except Exception:
+                    return "Respuesta de Gemini recibida pero vacía."
+            else:
+                err = await resp.text()
+                logging.error(f"Error Gemini API Status {resp.status}: {err}")
+                raise Exception(f"HTTP {resp.status}: {err}")
+
+# -------------------------------------------------------------
 # Comandos del Bot
 # -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -147,24 +177,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     
+    # 1. Si la mandó junto con el comando (/set_key MI_CLAVE)
     if context.args:
         key = context.args[0].strip()
         save_user_key(user_id, key)
+        await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
         try:
             await update.message.delete()
         except Exception:
             pass
-        await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
         return
 
+    # 2. Si sólo escribió /set_key, pedirla interactivamente
     user_data = get_user_data(user_id)
     provider = user_data["provider"].upper()
     set_awaiting_key(user_id, 1)
     
     await update.message.reply_text(
         f"📥 Configuración de clave para {provider}\n\n"
-        f"Por favor, envía tu API Key en el siguiente mensaje.\n"
-        f"(El mensaje se borrará automáticamente por seguridad una vez guardado)"
+        f"Por favor, envía tu API Key en el siguiente mensaje:"
     )
 
 # -------------------------------------------------------------
@@ -174,23 +205,27 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
 
-    # 1. Modo captura de clave
+    # A) Capturar clave si el bot la estaba esperando
     if user_data["awaiting_key"] == 1:
         new_key = update.message.text.strip()
+        
+        # Guardar en BD PRIMERO
         save_user_key(user_id, new_key)
         
+        # Confirmar al usuario que la clave YA se guardó
+        await update.message.reply_text(
+            f"🔒 ¡API Key de {user_data['provider'].upper()} guardada y activada con éxito!\n\n"
+            "Ya puedes enviarme cualquier mensaje de texto para procesarlo."
+        )
+        
+        # Intentar borrar el mensaje con la clave al final (si falla no afecta el guardado)
         try:
             await update.message.delete()
         except Exception:
             pass
-            
-        await update.message.reply_text(
-            f"🔒 ¡API Key de {user_data['provider'].upper()} guardada y activada!\n\n"
-            "Ya puedes enviarme cualquier texto o nota de voz para procesarlo."
-        )
         return
 
-    # 2. Procesar solicitud de IA
+    # B) Procesar solicitud de IA regular
     provider = user_data["provider"]
     api_key = user_data["api_key"]
 
@@ -224,19 +259,8 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # --- GEMINI ---
         if provider == "gemini":
-            client = genai.Client(api_key=api_key)
-            if is_voice:
-                uploaded_file = client.files.upload(file=audio_path)
-                res = client.models.generate_content(
-                    model='gemini-1.5-flash',
-                    contents=[uploaded_file, system_instructions]
-                )
-            else:
-                res = client.models.generate_content(
-                    model='gemini-1.5-flash',
-                    contents=[f"{system_instructions}\n\nMensaje del usuario: {user_text}"]
-                )
-            ai_response = res.text
+            prompt = f"{system_instructions}\n\nMensaje del usuario: {user_text if user_text else 'Nota de voz recibida'}"
+            ai_response = await call_gemini_api(api_key, prompt)
 
         # --- OPENAI ---
         elif provider == "openai":
@@ -274,6 +298,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.error(f"Error procesando con {provider}: {e}")
         await update.message.reply_text(
             f"❌ Error de conexión con {provider.upper()}.\n\n"
+            f"Detalle: {e}\n\n"
             f"Asegúrate de que tu API Key sea válida. Escribe /set_key para volver a ingresarla."
         )
     
