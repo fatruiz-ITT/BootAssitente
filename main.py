@@ -76,10 +76,10 @@ def save_user_key(user_id: int, api_key: str):
     conn.close()
 
 # -------------------------------------------------------------
-# Petición Directa HTTP a Gemini (Compatible con AQ... y AIza...)
+# Petición Directa HTTP a Gemini usando gemini-flash-latest
 # -------------------------------------------------------------
 async def call_gemini_api(api_key: str, text_prompt: str) -> str:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": api_key
@@ -97,9 +97,16 @@ async def call_gemini_api(api_key: str, text_prompt: str) -> str:
             if resp.status == 200:
                 data = await resp.json()
                 try:
-                    return data['candidates'][0]['content']['parts'][0]['text']
-                except Exception:
-                    return "Respuesta de Gemini recibida pero vacía."
+                    candidates = data.get('candidates', [])
+                    if not candidates:
+                        return "Gemini no devolvió ninguna respuesta."
+                    parts = candidates[0].get('content', {}).get('parts', [])
+                    for part in parts:
+                        if 'text' in part:
+                            return part['text']
+                    return "No se encontró texto en la respuesta de Gemini."
+                except Exception as e:
+                    return f"Error leyendo la respuesta: {e}"
             else:
                 err = await resp.text()
                 logging.error(f"Error Gemini API Status {resp.status}: {err}")
@@ -304,10 +311,8 @@ async def main():
     
     init_db()
     
-    # Iniciar servidor Web
     asyncio.create_task(run_web())
 
-    # Iniciar Bot de Telegram
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("modelo", select_model_menu))
