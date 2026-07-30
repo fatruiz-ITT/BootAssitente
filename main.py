@@ -96,14 +96,14 @@ async def start_web_server():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
+    provider_name = user_data['provider'].upper()
     
     await update.message.reply_text(
-        f"👋 **¡Hola! Soy tu asistente inteligente por voz y texto.**\n\n"
-        f"🤖 **Motor actual seleccionado:** `{user_data['provider'].upper()}`\n\n"
-        "📌 **Opciones disponibles:**\n"
-        "• Escribe **/modelo** para cambiar entre Gemini, OpenAI o Claude.\n"
-        "• Escribe **/set_key** para ingresar/actualizar tu API Key.",
-        parse_mode="Markdown"
+        f"👋 ¡Hola! Soy tu asistente inteligente por voz y texto.\n\n"
+        f"🤖 Motor actual seleccionado: {provider_name}\n\n"
+        "📌 Opciones disponibles:\n"
+        "• Usa /modelo para cambiar entre Gemini, OpenAI o Claude.\n"
+        "• Usa /set_key para ingresar tu API Key."
     )
 
 async def select_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,11 +119,10 @@ async def select_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"⚙️ **Configuración de Motor de IA**\n\n"
-        f"Actualmente estás usando: **{current_provider}**\n\n"
+        f"⚙️ Configuración de Motor de IA\n\n"
+        f"Actualmente estás usando: {current_provider}\n\n"
         f"Selecciona abajo cuál motor deseas activar:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        reply_markup=reply_markup
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -139,11 +138,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key_status = "✅ Configurada" if user_data["api_key"] else "❌ No configurada"
 
     await query.edit_message_text(
-        f"🎉 **¡Motor actualizado con éxito!**\n\n"
-        f"🤖 **Motor activo:** `{provider.upper()}`\n"
-        f"🔑 **Estado de la API Key:** {key_status}\n\n"
-        f"Si aún no registras tu clave o deseas cambiarla, escribe ahora **/set_key**.",
-        parse_mode="Markdown"
+        f"🎉 ¡Motor actualizado con éxito!\n\n"
+        f"🤖 Motor activo: {provider.upper()}\n"
+        f"🔑 Estado de la API Key: {key_status}\n\n"
+        f"Si aún no registras tu clave o deseas cambiarla, escribe ahora /set_key."
     )
 
 async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,7 +154,7 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.delete()
         except Exception:
             pass
-        await update.message.reply_text("🔒 **¡API Key guardada con éxito de forma segura!**", parse_mode="Markdown")
+        await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
         return
 
     user_data = get_user_data(user_id)
@@ -164,10 +162,9 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_awaiting_key(user_id, 1)
     
     await update.message.reply_text(
-        f"📥 **Configuración de clave para {provider}**\n\n"
-        f"Por favor, **envía tu API Key en el siguiente mensaje**.\n"
-        f"*(El mensaje se borrará automáticamente por seguridad una vez guardado)*",
-        parse_mode="Markdown"
+        f"📥 Configuración de clave para {provider}\n\n"
+        f"Por favor, envía tu API Key en el siguiente mensaje.\n"
+        f"(El mensaje se borrará automáticamente por seguridad una vez guardado)"
     )
 
 # -------------------------------------------------------------
@@ -188,9 +185,8 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
             
         await update.message.reply_text(
-            f"🔒 **¡API Key de {user_data['provider'].upper()} guardada y activada!**\n\n"
-            "Ya puedes enviarme cualquier texto o nota de voz para procesarlo.",
-            parse_mode="Markdown"
+            f"🔒 ¡API Key de {user_data['provider'].upper()} guardada y activada!\n\n"
+            "Ya puedes enviarme cualquier texto o nota de voz para procesarlo."
         )
         return
 
@@ -200,9 +196,8 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if not api_key:
         await update.message.reply_text(
-            f"⚠️ **Atención:** Tienes seleccionado el motor **{provider.upper()}**, pero no has registrado tu API Key.\n\n"
-            "Escribe **/set_key** para ingresarla ahora.",
-            parse_mode="Markdown"
+            f"⚠️ Atención: Tienes seleccionado el motor {provider.upper()}, pero no has registrado tu API Key.\n\n"
+            "Escribe /set_key para ingresarla ahora."
         )
         return
 
@@ -210,7 +205,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_text = update.message.text if not is_voice else ""
 
     status_icon = "🎧" if is_voice else "💬"
-    await update.message.reply_text(f"{status_icon} Procesando solicitud con **{provider.upper()}**...")
+    await update.message.reply_text(f"{status_icon} Procesando solicitud con {provider.upper()}...")
 
     audio_path = None
     if is_voice:
@@ -221,13 +216,13 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         system_instructions = (
             "Eres un asistente personal altamente eficiente. Analiza la información recibida y responde estructurado así:\n"
-            "1. 📝 **Idea principal / Resumen**\n"
-            "2. 📌 **Tareas o Recordatorios**\n"
-            "3. 📅 **Eventos con fecha/hora** (si aplican)"
+            "1. 📝 Idea principal / Resumen\n"
+            "2. 📌 Tareas o Recordatorios\n"
+            "3. 📅 Eventos con fecha/hora (si aplican)"
         )
         ai_response = ""
 
-        # --- GEMINI (Soporta claves AIza y AQ) ---
+        # --- GEMINI ---
         if provider == "gemini":
             client = genai.Client(api_key=api_key)
             if is_voice:
@@ -273,14 +268,13 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.content[0].text
 
-        await update.message.reply_text(ai_response, parse_mode="Markdown")
+        await update.message.reply_text(ai_response)
 
     except Exception as e:
         logging.error(f"Error procesando con {provider}: {e}")
         await update.message.reply_text(
-            f"❌ **Error de conexión con {provider.upper()}.**\n\n"
-            f"Asegúrate de que tu API Key sea válida. Escribe **/set_key** para volver a ingresarla.",
-            parse_mode="Markdown"
+            f"❌ Error de conexión con {provider.upper()}.\n\n"
+            f"Asegúrate de que tu API Key sea válida. Escribe /set_key para volver a ingresarla."
         )
     
     finally:
