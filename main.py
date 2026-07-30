@@ -2,7 +2,6 @@ import os
 import logging
 import asyncio
 import sqlite3
-import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -10,6 +9,7 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 
+from google import genai
 from openai import OpenAI
 import anthropic
 
@@ -94,32 +94,55 @@ async def start_web_server():
 # Comandos del Bot
 # -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = get_user_data(user_id)
+    
     await update.message.reply_text(
-        "¡Hola! Soy tu asistente inteligente. 🎙️💬\n\n"
-        "Puedes enviarme **notas de voz** o **mensajes de texto**.\n\n"
-        "🔹 Usa **/modelo** para elegir tu motor de IA.\n"
-        "🔹 Usa **/set_key** para registrar tu API Key.",
+        f"👋 **¡Hola! Soy tu asistente inteligente por voz y texto.**\n\n"
+        f"🤖 **Motor actual seleccionado:** `{user_data['provider'].upper()}`\n\n"
+        "📌 **Opciones disponibles:**\n"
+        "• Escribe **/modelo** para cambiar entre Gemini, OpenAI o Claude.\n"
+        "• Escribe **/set_key** para ingresar/actualizar tu API Key.",
         parse_mode="Markdown"
     )
 
 async def select_model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = get_user_data(user_id)
+    current_provider = user_data["provider"].upper()
+
     keyboard = [
         [InlineKeyboardButton("🤖 Google Gemini", callback_data='set_provider_gemini')],
         [InlineKeyboardButton("🟢 OpenAI (GPT-4o)", callback_data='set_provider_openai')],
         [InlineKeyboardButton("🟣 Anthropic (Claude)", callback_data='set_provider_claude')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Elige el motor de IA que quieres usar:", reply_markup=reply_markup)
+    
+    await update.message.reply_text(
+        f"⚙️ **Configuración de Motor de IA**\n\n"
+        f"Actualmente estás usando: **{current_provider}**\n\n"
+        f"Selecciona abajo cuál motor deseas activar:",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    provider = query.data.replace('set_provider_', '')
-    save_user_provider(query.from_user.id, provider)
     
+    provider = query.data.replace('set_provider_', '')
+    user_id = query.from_user.id
+    
+    save_user_provider(user_id, provider)
+    user_data = get_user_data(user_id)
+    
+    key_status = "✅ Configurada" if user_data["api_key"] else "❌ No configurada"
+
     await query.edit_message_text(
-        f"✅ Motor cambiado a: **{provider.upper()}**.\n\n"
-        f"Escribe **/set_key** para ingresar tu API Key.",
+        f"🎉 **¡Motor actualizado con éxito!**\n\n"
+        f"🤖 **Motor activo:** `{provider.upper()}`\n"
+        f"🔑 **Estado de la API Key:** {key_status}\n\n"
+        f"Si aún no registras tu clave o deseas cambiarla, escribe ahora **/set_key**.",
         parse_mode="Markdown"
     )
 
@@ -133,7 +156,7 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.delete()
         except Exception:
             pass
-        await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
+        await update.message.reply_text("🔒 **¡API Key guardada con éxito de forma segura!**", parse_mode="Markdown")
         return
 
     user_data = get_user_data(user_id)
@@ -141,39 +164,11 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_awaiting_key(user_id, 1)
     
     await update.message.reply_text(
-        f"De acuerdo. Por favor, **ingresa ahora tu API Key de {provider}** mandándola en el siguiente mensaje:",
+        f"📥 **Configuración de clave para {provider}**\n\n"
+        f"Por favor, **envía tu API Key en el siguiente mensaje**.\n"
+        f"*(El mensaje se borrará automáticamente por seguridad una vez guardado)*",
         parse_mode="Markdown"
     )
-
-# -------------------------------------------------------------
-# Llamada Directa REST a Gemini (Soporta claves AQ. y AIza)
-# -------------------------------------------------------------
-async def call_gemini_direct(api_key: str, text_prompt: str) -> str:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": api_key
-    }
-    payload = {
-        "contents": [
-            {
-                "parts": [{"text": text_prompt}]
-            }
-        ]
-    }
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                try:
-                    return data['candidates'][0]['content']['parts'][0]['text']
-                except KeyError:
-                    return "No se pudo extraer la respuesta de Gemini."
-            else:
-                err_text = await resp.text()
-                logging.error(f"Error Gemini API ({resp.status}): {err_text}")
-                raise Exception(f"HTTP {resp.status}")
 
 # -------------------------------------------------------------
 # Procesador Unificado para Texto y Voz
@@ -182,7 +177,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
 
-    # Si está esperando clave
+    # 1. Modo captura de clave
     if user_data["awaiting_key"] == 1:
         new_key = update.message.text.strip()
         save_user_key(user_id, new_key)
@@ -193,19 +188,20 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
             
         await update.message.reply_text(
-            f"🔒 **¡API Key de {user_data['provider'].upper()} guardada con éxito!**\n"
-            "Ya puedes enviarme mensajes de texto o notas de voz.",
+            f"🔒 **¡API Key de {user_data['provider'].upper()} guardada y activada!**\n\n"
+            "Ya puedes enviarme cualquier texto o nota de voz para procesarlo.",
             parse_mode="Markdown"
         )
         return
 
+    # 2. Procesar solicitud de IA
     provider = user_data["provider"]
     api_key = user_data["api_key"]
 
     if not api_key:
         await update.message.reply_text(
-            f"⚠️ Tienes seleccionado **{provider.upper()}**, pero no has configurado tu API Key.\n"
-            "Escribe **/set_key** para ingresarla.",
+            f"⚠️ **Atención:** Tienes seleccionado el motor **{provider.upper()}**, pero no has registrado tu API Key.\n\n"
+            "Escribe **/set_key** para ingresarla ahora.",
             parse_mode="Markdown"
         )
         return
@@ -213,8 +209,8 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_voice = update.message.voice is not None
     user_text = update.message.text if not is_voice else ""
 
-    status_msg = "🎧 Procesando tu audio" if is_voice else "💬 Procesando tu mensaje"
-    await update.message.reply_text(f"{status_msg} con **{provider.upper()}**...")
+    status_icon = "🎧" if is_voice else "💬"
+    await update.message.reply_text(f"{status_icon} Procesando solicitud con **{provider.upper()}**...")
 
     audio_path = None
     if is_voice:
@@ -224,22 +220,28 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         system_instructions = (
-            "Eres un asistente personal altamente eficiente. Analiza la información recibida y responde de forma limpia:\n"
+            "Eres un asistente personal altamente eficiente. Analiza la información recibida y responde estructurado así:\n"
             "1. 📝 **Idea principal / Resumen**\n"
             "2. 📌 **Tareas o Recordatorios**\n"
             "3. 📅 **Eventos con fecha/hora** (si aplican)"
         )
         ai_response = ""
 
-        # --- GEMINI (REST Directo) ---
+        # --- GEMINI (Soporta claves AIza y AQ) ---
         if provider == "gemini":
+            client = genai.Client(api_key=api_key)
             if is_voice:
-                # Transcripción/procesamiento auxiliar para voz si es necesario, o prompt estándar
-                prompt = f"{system_instructions}\n\n[Nota de voz procesada]"
+                uploaded_file = client.files.upload(file=audio_path)
+                res = client.models.generate_content(
+                    model='gemini-1.5-flash',
+                    contents=[uploaded_file, system_instructions]
+                )
             else:
-                prompt = f"{system_instructions}\n\nMensaje del usuario: {user_text}"
-                
-            ai_response = await call_gemini_direct(api_key, prompt)
+                res = client.models.generate_content(
+                    model='gemini-1.5-flash',
+                    contents=[f"{system_instructions}\n\nMensaje del usuario: {user_text}"]
+                )
+            ai_response = res.text
 
         # --- OPENAI ---
         elif provider == "openai":
@@ -275,7 +277,11 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logging.error(f"Error procesando con {provider}: {e}")
-        await update.message.reply_text(f"❌ Error al conectar con {provider.upper()}. Revisa tu API Key enviando **/set_key** de nuevo.")
+        await update.message.reply_text(
+            f"❌ **Error de conexión con {provider.upper()}.**\n\n"
+            f"Asegúrate de que tu API Key sea válida. Escribe **/set_key** para volver a ingresarla.",
+            parse_mode="Markdown"
+        )
     
     finally:
         if audio_path and os.path.exists(audio_path):
