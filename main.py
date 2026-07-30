@@ -28,7 +28,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             provider TEXT DEFAULT 'gemini',
-            api_key TEXT
+            api_key TEXT,
+            awaiting_key INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
@@ -37,12 +38,12 @@ def init_db():
 def get_user_data(user_id: int):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('SELECT provider, api_key FROM users WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT provider, api_key, awaiting_key FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
-        return {"provider": row[0], "api_key": row[1]}
-    return {"provider": "gemini", "api_key": None}
+        return {"provider": row[0], "api_key": row[1], "awaiting_key": row[2]}
+    return {"provider": "gemini", "api_key": None, "awaiting_key": 0}
 
 def save_user_provider(user_id: int, provider: str):
     conn = sqlite3.connect(DB_NAME)
@@ -54,12 +55,22 @@ def save_user_provider(user_id: int, provider: str):
     conn.commit()
     conn.close()
 
+def set_awaiting_key(user_id: int, status: int):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO users (user_id, awaiting_key) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET awaiting_key=excluded.awaiting_key
+    ''', (user_id, status))
+    conn.commit()
+    conn.close()
+
 def save_user_key(user_id: int, api_key: str):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO users (user_id, api_key) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET api_key=excluded.api_key
+        INSERT INTO users (user_id, api_key, awaiting_key) VALUES (?, ?, 0)
+        ON CONFLICT(user_id) DO UPDATE SET api_key=excluded.api_key, awaiting_key=0
     ''', (user_id, api_key))
     conn.commit()
     conn.close()
@@ -68,7 +79,7 @@ def save_user_key(user_id: int, api_key: str):
 # Servidor Web Render
 # -------------------------------------------------------------
 async def handle_health_check(request):
-    return web.Response(text="Bot Multi-IA (Texto + Voz) activo!")
+    return web.Response(text="Bot Multi-IA Activo!")
 
 async def start_web_server():
     app = web.Application()
@@ -86,8 +97,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "¡Hola! Soy tu asistente inteligente. 🎙️💬\n\n"
         "Puedes enviarme **notas de voz** o **mensajes de texto**.\n\n"
-        "🔹 Usa **/modelo** para elegir qué IA prefieres (Gemini, OpenAI, Claude).\n"
-        "🔹 Usa **/set_key TU_CLAVE** para registrar tu API Key.",
+        "🔹 Usa **/modelo** para elegir tu motor de IA.\n"
+        "🔹 Usa **/set_key** para registrar tu API Key de forma guiada.",
         parse_mode="Markdown"
     )
 
@@ -105,23 +116,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     provider = query.data.replace('set_provider_', '')
     save_user_provider(query.from_user.id, provider)
-    await query.edit_message_text(f"✅ Motor cambiado a: **{provider.upper()}**.", parse_mode="Markdown")
+    
+    await query.edit_message_text(
+        f"✅ Motor cambiado a: **{provider.upper()}**.\n\n"
+        f"Escribe **/set_key** para ingresar tu API Key.",
+        parse_mode="Markdown"
+    )
 
-async def set_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if not context.args:
-        await update.message.reply_text("❌ Uso correcto: `/set_key TU_API_KEY`", parse_mode="Markdown")
+    
+    # Si envió la clave en el mismo comando (método rápido)
+    if context.args:
+        key = context.args[0].strip()
+        save_user_key(user_id, key)
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
         return
+
+    # Método guiado: Preguntar y activar modo espera
+    user_data = get_user_data(user_id)
+    provider = user_data["provider"].upper()
+    set_awaiting_key(user_id, 1)
     
-    key = context.args[0].strip()
-    save_user_key(user_id, key)
-    
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-        
-    await update.message.reply_text("🔒 ¡API Key guardada con éxito de forma segura!")
+    await update.message.reply_text(
+        f"De acuerdo. Por favor, **ingresa ahora tu API Key de {provider}** mandándola en el siguiente mensaje:",
+        parse_mode="Markdown"
+    )
 
 # -------------------------------------------------------------
 # Procesador Unificado para Texto y Voz
@@ -129,18 +153,37 @@ async def set_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_data = get_user_data(user_id)
+
+    # 1. Si el bot está ESPERANDO la API Key del usuario
+    if user_data["awaiting_key"] == 1:
+        new_key = update.message.text.strip()
+        save_user_key(user_id, new_key)
+        
+        # Borrar el mensaje con la clave por privacidad
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+            
+        await update.message.reply_text(
+            f"🔒 **¡API Key de {user_data['provider'].upper()} guardada con éxito!**\n"
+            "Ya puedes enviarme mensajes de texto o notas de voz para procesarlos.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # 2. Si NO está esperando clave, procesar como entrada normal (Voz o Texto)
     provider = user_data["provider"]
     api_key = user_data["api_key"]
 
     if not api_key:
         await update.message.reply_text(
             f"⚠️ Tienes seleccionado **{provider.upper()}**, pero no has configurado tu API Key.\n"
-            "Usa `/set_key TU_CLAVE` para empezar.",
+            "Escribe **/set_key** para ingresarla.",
             parse_mode="Markdown"
         )
         return
 
-    # Determinar si el mensaje es Nota de Voz o Texto
     is_voice = update.message.voice is not None
     user_text = update.message.text if not is_voice else ""
 
@@ -162,7 +205,6 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         ai_response = ""
 
-        # --- GEMINI ---
         if provider == "gemini":
             client = genai.Client(api_key=api_key)
             if is_voice:
@@ -178,7 +220,6 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             ai_response = res.text
 
-        # --- OPENAI ---
         elif provider == "openai":
             client = OpenAI(api_key=api_key)
             if is_voice:
@@ -197,7 +238,6 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.choices[0].message.content
 
-        # --- CLAUDE ---
         elif provider == "claude":
             client = anthropic.Anthropic(api_key=api_key)
             prompt_content = f"Texto del usuario: {user_text}" if not is_voice else "Nota de voz recibida"
@@ -212,7 +252,7 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logging.error(f"Error procesando con {provider}: {e}")
-        await update.message.reply_text(f"❌ Error al conectar con {provider.upper()}. Revisa tu API Key.")
+        await update.message.reply_text(f"❌ Error al conectar con {provider.upper()}. Revisa tu API Key enviando **/set_key** de nuevo.")
     
     finally:
         if audio_path and os.path.exists(audio_path):
@@ -231,10 +271,9 @@ async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("modelo", select_model_menu))
-    app.add_handler(CommandHandler("set_key", set_key))
+    app.add_handler(CommandHandler("set_key", set_key_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Manejar TANTO notas de voz COMO mensajes de texto (excluyendo comandos)
     app.add_handler(MessageHandler(filters.VOICE, process_user_input))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_user_input))
 
