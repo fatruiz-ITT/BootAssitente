@@ -76,21 +76,6 @@ def save_user_key(user_id: int, api_key: str):
     conn.close()
 
 # -------------------------------------------------------------
-# Servidor Web Render
-# -------------------------------------------------------------
-async def handle_health_check(request):
-    return web.Response(text="Bot Multi-IA Activo!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
-# -------------------------------------------------------------
 # Petición Directa HTTP a Gemini (Compatible con AQ... y AIza...)
 # -------------------------------------------------------------
 async def call_gemini_api(api_key: str, text_prompt: str) -> str:
@@ -249,12 +234,10 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         ai_response = ""
 
-        # --- GEMINI ---
         if provider == "gemini":
             prompt = f"{system_instructions}\n\nMensaje del usuario: {user_text if user_text else 'Nota de voz recibida'}"
             ai_response = await call_gemini_api(api_key, prompt)
 
-        # --- OPENAI ---
         elif provider == "openai":
             client = OpenAI(api_key=api_key)
             if is_voice:
@@ -273,7 +256,6 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             ai_response = res.choices[0].message.content
 
-        # --- CLAUDE ---
         elif provider == "claude":
             client = anthropic.Anthropic(api_key=api_key)
             prompt_content = f"Texto del usuario: {user_text}" if not is_voice else "Nota de voz recibida"
@@ -299,15 +281,33 @@ async def process_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             os.remove(audio_path)
 
 # -------------------------------------------------------------
-# Inicialización
+# Servidor Web Render Independiente
+# -------------------------------------------------------------
+async def handle_health(request):
+    return web.Response(text="Bot Activo")
+
+async def run_web():
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# -------------------------------------------------------------
+# Ejecución Principal
 # -------------------------------------------------------------
 async def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("Falta TELEGRAM_TOKEN.")
     
     init_db()
-    await start_web_server()
+    
+    # Iniciar servidor Web
+    asyncio.create_task(run_web())
 
+    # Iniciar Bot de Telegram
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("modelo", select_model_menu))
@@ -319,7 +319,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    await app.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
